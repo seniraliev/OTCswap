@@ -1,0 +1,187 @@
+import { SignerWithAddress } from "@nomiclabs/hardhat-ethers/signers";
+import { MockERC20, OTCSwap, OTCSwap__factory } from "../types";
+import { deployments } from "hardhat";
+import chai from "chai";
+import { solidity } from "ethereum-waffle";
+import { Ship } from "../utils";
+import { parseEther } from "ethers/lib/utils";
+import { time } from "@nomicfoundation/hardhat-network-helpers";
+
+chai.use(solidity);
+const { expect } = chai;
+
+let ship: Ship;
+let swap: OTCSwap;
+
+let token1: MockERC20;
+let token2: MockERC20;
+
+let alice: SignerWithAddress;
+let bob: SignerWithAddress;
+let vault: SignerWithAddress;
+
+const setup = deployments.createFixture(async (hre) => {
+  ship = await Ship.init(hre);
+  const { accounts, users } = ship;
+  await deployments.fixture(["otc-swap"]);
+
+  return {
+    ship,
+    accounts,
+    users,
+  };
+});
+
+enum State {
+  Pending,
+  Finished,
+  Canceled,
+}
+
+describe("OTC Swap test", () => {
+  before(async () => {
+    const scaffold = await setup();
+
+    alice = scaffold.accounts.alice;
+    bob = scaffold.accounts.bob;
+    vault = scaffold.accounts.vault;
+
+    swap = await ship.connect(OTCSwap__factory);
+
+    token1 = (await ship.connect("TestToken1")) as MockERC20;
+    token2 = (await ship.connect("TestToken2")) as MockERC20;
+
+    await token1.connect(alice).mint(parseEther("10"));
+    await token1.connect(alice).approve(swap.address, parseEther("10"));
+    await token2.connect(bob).mint(parseEther("10"));
+    await token2.connect(bob).approve(swap.address, parseEther("10"));
+  });
+
+  it("Create new swap between Alice and Bob", async () => {
+    const currentTime = (await ship.provider.getBlock("latest")).timestamp;
+
+    const createParam: OTCSwap.SwapStruct = {
+      operator1: alice.address,
+      operator2: bob.address,
+      token1: token1.address,
+      token2: token2.address,
+      amount1: parseEther("1"),
+      amount2: parseEther("2"),
+      expireTime: currentTime,
+    };
+
+    // expire time should be valid
+    await expect(swap.create(createParam)).to.revertedWith("OTCSwap: Invalid expire time");
+
+    await expect(swap.create({ ...createParam, expireTime: currentTime + 3600 }))
+      .to.emit(swap, "SwapCreated")
+      .withArgs(
+        0,
+        alice.address,
+        bob.address,
+        token1.address,
+        parseEther("1"),
+        token2.address,
+        parseEther("2"),
+      )
+      .emit(swap, "SwapStateChanged")
+      .withArgs(0, false, false, State.Pending);
+
+    const swapData = await swap.swaps(0);
+    const swapState = await swap.swapStates(0);
+
+    expect(swapData.operator1).to.eq(alice.address);
+    expect(swapData.operator2).to.eq(bob.address);
+    expect(swapData.token1).to.eq(token1.address);
+    expect(swapData.token2).to.eq(token2.address);
+    expect(swapData.amount1).to.eq(parseEther("1"));
+    expect(swapData.amount2).to.eq(parseEther("2"));
+
+    expect(swapState.operator1Deposited).to.eq(false);
+    expect(swapState.operator2Deposited).to.eq(false);
+    expect(swapState.state).to.eq(State.Pending);
+
+    /// create new swap for cancel test
+    await swap.create({ ...createParam, expireTime: currentTime + 3600 });
+  });
+
+  it("Alice and Bob can deposit token for swap", async () => {
+    /// vault can't deposit token
+    await expect(swap.connect(vault).deposit(0)).to.revertedWith(
+      "OTCSwap: You are not operator of this swap",
+    );
+
+    await expect(swap.connect(alice).deposit(0))
+      .emit(token1, "Transfer")
+      .withArgs(alice.address, swap.address, parseEther("1"))
+      .to.emit(swap, "SwapStateChanged")
+      .withArgs(0, true, false, State.Pending);
+    await expect(swap.connect(bob).deposit(0))
+      .emit(token2, "Transfer")
+      .withArgs(bob.address, swap.address, parseEther("2"))
+      .to.emit(swap, "SwapStateChanged")
+      .withArgs(0, true, true, State.Pending);
+
+    // can't deposit again
+    await expect(swap.connect(alice).deposit(0)).to.revertedWith("OTCSwap: You already deposited token");
+
+    const swapState = await swap.swapStates(0);
+    expect(swapState.operator1Deposited).to.eq(true);
+    expect(swapState.operator2Deposited).to.eq(true);
+    expect(swapState.state).to.eq(State.Pending);
+  });
+
+  it("Can't cancel swap after deposited", async () => {
+    await expect(swap.cancel(0)).to.revertedWith("OTCSwap: Can't cancel this swap");
+  });
+
+  it("Finish swap", async () => {
+    // anyone can call this function
+    await expect(swap.finish(0))
+      .emit(token1, "Transfer")
+      .withArgs(swap.address, bob.address, parseEther("1"))
+      .emit(token2, "Transfer")
+      .withArgs(swap.address, alice.address, parseEther("2"))
+      .to.emit(swap, "SwapStateChanged")
+      .withArgs(0, true, true, State.Finished);
+
+    const swapState = await swap.swapStates(0);
+    expect(swapState.operator1Deposited).to.eq(true);
+    expect(swapState.operator2Deposited).to.eq(true);
+    expect(swapState.state).to.eq(State.Finished);
+  });
+
+  it("Can't cancel swap before expire time", async () => {
+    await expect(swap.cancel(1)).to.revertedWith("OTCSwap: swap isn't expired yet");
+  });
+
+  it("Can't deposit token after expired", async () => {
+    await expect(swap.connect(alice).deposit(1))
+      .emit(token1, "Transfer")
+      .withArgs(alice.address, swap.address, parseEther("1"))
+      .to.emit(swap, "SwapStateChanged")
+      .withArgs(1, true, false, State.Pending);
+
+    // advance time after expired time
+    await time.increase(3600);
+
+    await expect(swap.connect(bob).deposit(1)).to.revertedWith("OTCSwap: This swap already expired");
+  });
+
+  it("Can't finish swap if someone didn't deposit in expire time", async () => {
+    await expect(swap.finish(1)).to.revertedWith("OTCSwap: Operators didn't deposit token yet");
+  });
+
+  it("Everyone can cancel swap after expire time", async () => {
+    await expect(swap.cancel(1))
+      .emit(swap, "SwapStateChanged")
+      .withArgs(1, true, false, State.Canceled)
+      .to.emit(token1, "Transfer")
+      .withArgs(swap.address, alice.address, parseEther("1"));
+
+    const swapState = await swap.swapStates(1);
+    expect(swapState.operator1Deposited).to.eq(true);
+    expect(swapState.operator2Deposited).to.eq(false);
+    expect(swapState.state).to.eq(State.Canceled);
+  });
+});
